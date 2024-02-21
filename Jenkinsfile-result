@@ -1,0 +1,110 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+            apiVersion: v1
+            kind: Pod
+            metadata:
+                name: kaniko
+            spec:
+                restartPolicy: Never
+                volumes:
+                - name: kaniko-secret
+                  secret:
+                    secretName: kaniko-secret
+                containers:
+                - name: kaniko
+                  image: gcr.io/kaniko-project/executor:debug
+                  command:
+                  - /busybox/cat
+                  tty: true
+                  volumeMounts:
+                  - name: kaniko-secret
+                    mountPath: /kaniko/.docker
+            """
+        }
+    }
+
+    environment {
+        DOCKER_HUB_USER = 'rutwiksquareops'
+        github_clone_url = ""
+        git_branch = "main"
+        BUILD_DATE = sh(script: 'date "+%Y-%m-%d"', returnStdout: true).trim()
+        credentials_ID = "github"
+        email_id = "rutwik@squareops.com"
+        user_name= "rutwiksquareops"
+        helmchart_repo_url = "https://github.com/rutwiksquareops/helm-argo-cd.git"
+
+
+    }
+
+    stages {
+        stage("Clone the github code in kaniko container") {
+            steps {
+                echo "Cloning the app"
+                container('kaniko') {
+                    echo "${git_branch}, ${github_clone_url}"
+                    git branch: "${git_branch}", url: "${github_clone_url}"  
+                    echo "Successfully clone the github repo code into the kaniko container"                
+                }
+            }
+        }
+
+        stage("Build and Push docker image to docker hub") {
+            steps {
+                echo "Building the code"
+                container('kaniko') {
+                    // Use Kaniko to build the Docker image
+                    sh "/kaniko/executor --dockerfile `pwd`/result/Dockerfile --context=`pwd` --destination=${DOCKER_HUB_USER}/vote-app-result:${BUILD_NUMBER}"
+                    echo"vote image successfully build and pushed"
+                }
+            }
+        }
+
+         stage('Update Helm Chart and Push to Git') {
+            agent {
+                kubernetes {
+                    label 'jenkinsrun'
+                    defaultContainer 'builder'
+                    yaml """
+                    apiVersion: v1
+                    kind: Pod
+                    spec:
+                      containers:
+                      - name: builder
+                        image: squareops/jenkins-build-agent:v3
+                        securityContext:
+                          privileged: true
+                        volumeMounts:
+                          - name: builder-storage
+                            mountPath: /var/lib/docker
+                      volumes:
+                        - name: builder-storage
+                          emptyDir: {}
+                    """
+                }
+            }
+            steps {
+                script {
+                    withCredentials([gitUsernamePassword(credentialsId: "${credentials_ID}", gitToolName: 'Default')]) {
+                        sh '''
+                        git clone ${helmchart_repo_url}
+                        git config --global user.email ${email_id}
+                        git config --global user.name ${user_name}
+                        ls -la
+                        pwd
+                        cd Votingapp-ArgoCD
+                        ls -la
+                        cd vote-chart
+                        ls -la
+                        yq e -i '.image.tag = "'$BUILD_NUMBER'"' values.yaml
+                        git add .
+                        git commit -m 'Docker Image version Update "'$JOB_NAME'"-"'$BUILD_NUMBER'"'
+                        git push origin main
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
